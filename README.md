@@ -4,7 +4,7 @@
 
 A local Windows dashboard for a single StandX perpetual market. It places two-sided post-only limit quotes at the chosen distance from mark price. Created by [@crryptooKerim](https://x.com/crryptooKerim).
 
-> Experimental trading software. Live orders can fill, limit exits may never fill, and an emergency market exit can lose more than the configured threshold. Monitor your StandX account. Profit and Maker Hours are not guaranteed.
+> Experimental trading software. Live orders can fill despite quote refreshes. Reduce-only market exits may incur taker fees and slippage or fail to close fully. Monitor your StandX account. Profit and Maker Hours are not guaranteed.
 
 ## Install
 
@@ -22,9 +22,11 @@ Copy-Item .env.example .env
 4. Run `py main.py` to see startup errors or double-click `run_app.pyw` for a console-free window. `create_shortcut.bat` optionally creates an icon-bearing desktop shortcut.
 5. On Windows, `build_windows.bat` optionally installs PyInstaller and creates `dist/Standgrox Maker Bot.exe`. Place your private `.env` beside the EXE. The EXE build has not been verified here on Windows.
 
-The app starts in **simulation** mode. Select a market, target/min/max BPS, balance usage, leverage and emergency loss threshold. For real orders, check **Enable live orders** and confirm. The bot may change account leverage if there are no open orders or positions on that market.
+The app starts in **simulation** mode. Select a market, target/min/max BPS, balance usage and leverage. For real orders, check **Enable live orders** and confirm. The bot may change account leverage if there are no open orders or positions on that market.
 
-**Stop** requests cancellation of this bot's entry and reduce-only exit orders on the selected market and verifies the open-order response. It does **not** close an open position. If cancellation is not confirmed, inspect StandX immediately. Other strategies' orders remain untouched.
+The bot checks positions approximately once a second, pulls quotes as the mark approaches their minimum BPS distance, and submits a reduce-only **market** order after detecting a fill. It confirms the position reaches zero before resuming. A fast move, API delay, rejection, partial fill or network failure may still leave a position open. Market exits incur taker fees and slippage. If an order disappears unexpectedly or an exit is not confirmed, the bot stops sending entries; inspect StandX immediately.
+
+**Stop** cancels the bot's open orders. If a bot entry filled during the session, it attempts a reduce-only market close and checks the resulting position. Existing positions from before bot startup are not closed automatically. Other strategies' orders remain untouched. Always confirm the actual position and order state in StandX after stopping.
 
 ## Files and privacy
 

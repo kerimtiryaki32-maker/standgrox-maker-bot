@@ -4,7 +4,7 @@
 
 Tek bir StandX vadeli işlem pazarında mark fiyata göre iki taraflı post-only limit emirleri yerleştiren yerel Windows panelidir. İlk açılış **simülasyon** modundadır.
 
-> Deneysel işlem yazılımıdır. Canlı emirler gerçekleşebilir, limit çıkış gerçekleşmeyebilir, acil market çıkışı belirlediğiniz eşikten fazla zarar yazabilir. StandX hesabınızı izleyin. Kâr veya Maker Hours garantisi yoktur.
+> Deneysel işlem yazılımıdır. Emirler yenilense de gerçekleşebilir. Azaltıcı market çıkışında taker ücreti ve fiyat kayması olabilir; pozisyon tamamen kapanmayabilir. StandX hesabınızı izleyin. Kâr veya Maker Hours garantisi yoktur.
 
 ## Kurulum
 
@@ -22,9 +22,11 @@ Copy-Item .env.example .env
 4. Hatayı terminalde görmek için `py main.py`, pencereli açmak için `run_app.pyw` çalıştırın. `create_shortcut.bat` isteğe bağlı olarak masaüstü kısayolu oluşturur.
 5. Windows'ta `build_windows.bat` isteğe bağlı PyInstaller kurar ve `dist/Standgrox Maker Bot.exe` üretir. EXE kullanırken özel `.env` dosyanız EXE'nin yanında bulunmalıdır. EXE burada Windows üzerinde doğrulanmadı.
 
-Panelden pazar, hedef/alt/üst BPS, bakiye kullanımı, kaldıraç ve acil zarar eşiği seçilir. Canlı işlem için **Canlı emirleri etkinleştir** seçilip onay verilmelidir. İlgili pazarda açık emir veya pozisyon yoksa bot hesap kaldıracını değiştirebilir.
+Panelden pazar, hedef/alt/üst BPS, bakiye kullanımı ve kaldıraç seçilir. Canlı işlem için **Canlı emirleri etkinleştir** seçilip onay verilmelidir. İlgili pazarda açık emir veya pozisyon yoksa bot hesap kaldıracını değiştirebilir.
 
-**Durdur** bu botun ilgili pazarda açtığı giriş ve çıkış emirlerini iptal etmeye çalışır ve açık emir sonucunu doğrular. Pozisyonu kapatmaz. İptal doğrulanmazsa StandX hesabını hemen kontrol edin. Çıkış emri iptal edilen açık pozisyonu ayrıca yönetmeniz gerekir. Başka stratejilerin emirlerine dokunulmaz.
+Bot yaklaşık her saniye pozisyonu kontrol eder; mark fiyatı alt BPS sınırına yaklaşınca emirleri yeniler. Bir giriş gerçekleşirse azaltıcı **market** emirle pozisyonu kapatmayı dener ve sıfırlandığını doğrulamadan yeni giriş açmaz. Ani fiyat hareketi, API gecikmesi, ret, kısmi gerçekleşme veya bağlantı sorunu pozisyonu açık bırakabilir. Market çıkışında taker ücreti ve fiyat kayması vardır. Beklenmedik emir kaybında veya çıkış doğrulanmazsa bot yeni girişleri durdurur; StandX hesabını hemen kontrol edin.
+
+**Durdur**, botun açık emirlerini iptal eder. Bu oturumda botun girişi gerçekleşmişse azaltıcı market emirle kapatmayı dener ve pozisyonu kontrol eder. Başlamadan önce mevcut olan pozisyonları otomatik kapatmaz. Diğer stratejilerin emirlerine dokunmaz. Durdurduktan sonra açık emirleri ve pozisyonu StandX üzerinden doğrulayın.
 
 ## GitHub dosya kontrolü
 
