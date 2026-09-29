@@ -31,9 +31,12 @@ SYMBOL = "BTC-USD"
 TARGET_BPS = Decimal("5.5")
 MIN_BPS = Decimal("5")
 MAX_BPS = Decimal("6")
-LOOP_SECONDS = 1
+LOOP_SECONDS = 3
+MIN_REPLACE_SECONDS = 10
 MAX_MARGIN_FRACTION = Decimal("0.10")  # at most 10% of free cross balance
 MAX_LEVERAGE = 10                       # refuse to run if account is above this
+MAX_LOSS_FRACTION = Decimal("0.02")    # emergency threshold: 2% of starting equity
+EXIT_REPRICE_BPS = Decimal("2")
 DRY_RUN = False                         # live trading; orders may execute
 PREFIX = "SM55-"
 
@@ -63,9 +66,7 @@ class MakerBot:
         self.price_decimals = int(self.info["price_tick_decimals"])
         self.qty_decimals = int(self.info["qty_tick_decimals"])
         self.min_qty = D(self.info["min_order_qty"])
-        self.entry_submitted = False
-        self.exit_submitted = False
-        self.active_entry_ids = set()
+        self.last_change = 0.0
         self.start_equity = D(self.get_balance()["equity"])
         if self.start_equity <= 0:
             raise RuntimeError("Account equity must be positive")
@@ -107,12 +108,8 @@ class MakerBot:
             "/api/query_positions", {"symbol": SYMBOL}, auth=True
         ))
         rows = data if isinstance(data, list) else data.get("positions", [])
-        if not isinstance(rows, list):
-            raise RuntimeError(f"Unexpected position response: {data}")
         for row in rows:
             if row.get("symbol") == SYMBOL:
-                if "qty" not in row:
-                    raise RuntimeError(f"Position quantity missing: {row}")
                 return D(row.get("qty", "0")), D(row.get("entry_price", "0"))
         return Decimal(0), Decimal(0)
 
@@ -151,19 +148,12 @@ class MakerBot:
         if DRY_RUN:
             self.log(f"[SIMULATION] new_order {payload}")
             return None
-        if not reduce_only:
-            # A timeout can still mean the exchange accepted the order.
-            self.entry_submitted = True
         self.log(f"Sending {side} {'exit' if reduce_only else 'entry'}: {qty} @ {price}")
         unwrap(self.client._post_signed("/api/new_order", payload))
         # HTTP success only accepts the request; verify actual book placement.
         for _ in range(8):
-            if self.stop_event.wait(0.25):
-                break
+            time.sleep(0.5)
             if any(x.get("cl_ord_id") == cl_id for x in self.all_open_orders()):
-                return cl_id
-            if not reduce_only and self.get_position()[0]:
-                # A fill before the first order-book snapshot is a valid outcome.
                 return cl_id
         raise RuntimeError(
             f"Order {cl_id} not confirmed open. Inspect order history; "
@@ -177,10 +167,9 @@ class MakerBot:
         unwrap(self.client._post_signed(
             "/api/cancel_order", {"order_id": int(order["id"])}
         ))
-        for _ in range(16):
-            time.sleep(0.25)
+        for _ in range(8):
+            time.sleep(0.5)
             if not any(x.get("id") == order["id"] for x in self.all_open_orders()):
-                self.active_entry_ids.discard(str(order.get("cl_ord_id", "")))
                 return
         raise RuntimeError("Cancellation unconfirmed; bot stopped")
 
@@ -220,10 +209,6 @@ class MakerBot:
     def manage_entry(self, mark, orders):
         bid, ask = self.entry_prices(mark)
         owned = self.owned(orders)
-        seen = {str(x.get("cl_ord_id")) for x in owned if not x.get("reduce_only")}
-        missing = self.active_entry_ids - seen
-        if missing and not DRY_RUN:
-            raise RuntimeError("A bot entry disappeared from open orders; possible fill. Stopped without placing another entry")
         sides = {side: [x for x in owned if x.get("side") == side]
                  for side in ("buy", "sell")}
         if any(len(rows) > 1 for rows in sides.values()):
@@ -232,43 +217,38 @@ class MakerBot:
         for side, target in (("buy", bid), ("sell", ask)):
             if self.stop_event.is_set():
                 return
-            if not DRY_RUN and self.get_position()[0]:
-                return
             current = sides[side][0] if sides[side] else None
             if current is not None:
                 distance = ((mark - D(current["price"])) if side == "buy"
                             else (D(current["price"]) - mark)) / mark * 10000
-                # Pull the approaching side before it reaches the minimum.
-                approach_trigger = MIN_BPS + (TARGET_BPS - MIN_BPS) / 2
-                if approach_trigger < distance <= MAX_BPS:
+                if MIN_BPS <= distance <= MAX_BPS:
+                    continue
+                if time.monotonic() - self.last_change < MIN_REPLACE_SECONDS:
                     continue
                 self.cancel(current)
-                if not DRY_RUN and self.get_position()[0]:
-                    return
+                self.last_change = time.monotonic()
             qty = planned_qty if planned_qty is not None else self.entry_qty(mark)
-            if not DRY_RUN:
-                latest_mark = self.get_mark()
-                if abs(latest_mark - mark) / mark * 10000 >= Decimal("0.5"):
-                    return  # Recompute both quotes using fresh market data.
-            cl_id = self.send(side, qty, target)
-            if cl_id:
-                self.active_entry_ids.add(cl_id)
+            self.send(side, qty, target)
+            self.last_change = time.monotonic()
             # A newly placed entry could have filled before the second side.
             if not DRY_RUN and self.get_position()[0] != 0:
                 return
 
-    def close_filled_position(self):
-        # A resting opposite-side entry may fill too. Cancel and verify all
-        # bot entries before determining the final quantity to reduce.
-        self.cancel_owned(self.all_open_orders())
+    def exit_price(self, position_qty):
+        best_bid, best_ask = self.depth()
+        # Join the nearest resting price on the correct side of the spread.
+        price = best_ask if position_qty > 0 else best_bid
+        rounding = ROUND_UP if position_qty > 0 else ROUND_DOWN
+        return quantize_step(price, self.price_decimals, rounding)
+
+    def emergency_close(self, position_qty, orders):
+        self.cancel_owned(orders)
+        if DRY_RUN:
+            self.log(f"[SIMULATION] EMERGENCY MARKET REDUCE ONLY {position_qty}")
+            return
         current_qty, _ = self.get_position()
         if current_qty == 0:
             return
-        if DRY_RUN:
-            self.log(f"[SIMULATION] reduce-only market close {current_qty}")
-            return
-        if self.exit_submitted:
-            raise RuntimeError("Prior market close is unconfirmed; will not send a duplicate")
         payload = {
             "symbol": SYMBOL,
             "side": "sell" if current_qty > 0 else "buy",
@@ -277,20 +257,38 @@ class MakerBot:
             "qty": format(abs(current_qty), "f"),
             "reduce_only": True,
         }
-        self.log(f"Filled position {current_qty}; submitting reduce-only market close")
-        # The response is asynchronous. Never send another close blindly if
-        # the request times out or if only part of the position is reduced.
-        self.exit_submitted = True
         unwrap(self.client._post_signed("/api/new_order", payload))
-        for _ in range(20):
-            time.sleep(0.25)
-            if self.get_position()[0] == 0:
-                self.exit_submitted = False
-                self.entry_submitted = False
-                self.active_entry_ids.clear()
-                self.log("Position closed and verified; maker quoting may resume")
+        raise RuntimeError("Emergency close submitted; verify fill in StandX")
+
+    def manage_position(self, mark, qty, entry, orders):
+        self.cancel_owned([x for x in orders if not x.get("reduce_only")])
+        orders = self.all_open_orders() if not DRY_RUN else orders
+        qty, entry = self.get_position()
+        if qty == 0:
+            return
+        exits = [x for x in self.owned(orders) if x.get("reduce_only")]
+        if len(exits) > 1:
+            raise RuntimeError("Multiple exit orders; stopped")
+        # Mark-to-market loss, excluding funding and trading fees.
+        unrealized = (mark - entry) * qty
+        loss_limit = self.start_equity * MAX_LOSS_FRACTION
+        if unrealized <= -loss_limit:
+            self.log(f"Emergency threshold: uPnL={unrealized:.2f}, limit=-{loss_limit:.2f}")
+            self.emergency_close(qty, orders)
+            return
+        price = self.exit_price(qty)
+        side = "sell" if qty > 0 else "buy"
+        if exits:
+            old = exits[0]
+            diff = abs(D(old["price"]) - price) / mark * 10000
+            if (D(old["qty"]) == abs(qty) and old.get("side") == side
+                    and diff < EXIT_REPRICE_BPS):
                 return
-        raise RuntimeError("Market close unconfirmed or partial. Bot stopped; inspect StandX position immediately")
+            if time.monotonic() - self.last_change < MIN_REPLACE_SECONDS:
+                return
+            self.cancel(old)
+        self.send(side, abs(qty), price, reduce_only=True)
+        self.last_change = time.monotonic()
 
     def run(self):
         try:
@@ -299,8 +297,6 @@ class MakerBot:
                 raise RuntimeError(
                     f"Existing {SYMBOL} orders detected. Review them in StandX before starting."
                 )
-            if self.get_position()[0]:
-                raise RuntimeError("Existing position detected before start. Manage it in StandX; no new entries sent")
             self.log(f"Mode={'SIMULATION' if DRY_RUN else 'LIVE'}, {SYMBOL}, "
                      f"entry={TARGET_BPS} bps, leverage={self.leverage}x")
             while not self.stop_event.is_set():
@@ -318,9 +314,7 @@ class MakerBot:
                 if unknown:
                     raise RuntimeError("Unknown order appeared; stopped")
                 if qty:
-                    if not self.entry_submitted:
-                        raise RuntimeError("Unrecognized position detected; no automatic close")
-                    self.close_filled_position()
+                    self.manage_position(mark, qty, entry, orders)
                 else:
                     exits = [x for x in self.owned(orders) if x.get("reduce_only")]
                     if exits:
@@ -332,7 +326,8 @@ class MakerBot:
         except Exception as exc:
             self.log(f"STOPPED: {exc}")
         finally:
-            # A fill may race with Stop, order placement, or cancellation.
+            # Cancel ALL bot-owned orders, including reduce-only exits. Never
+            # cancel another strategy's orders or silently market-close a position.
             try:
                 if DRY_RUN:
                     self.log("Simulation stopped; no live orders were sent.")
@@ -349,11 +344,8 @@ class MakerBot:
                         raise RuntimeError(f"{len(remaining)} bot orders still open")
                     self.log("All bot-owned open orders canceled and verified.")
                 position_qty, _ = self.get_position()
-                if position_qty and self.entry_submitted and not self.exit_submitted:
-                    self.log("Position detected during shutdown; attempting immediate close")
-                    self.close_filled_position()
-                elif position_qty:
-                    self.log(f"POSITION STILL OPEN ({position_qty} {SYMBOL}); manage it in StandX immediately")
+                if position_qty:
+                    self.log(f"POSITION STILL OPEN ({position_qty} {SYMBOL}). No exit order remains; manage it in StandX.")
             except Exception as exc:
                 self.log(f"CANCEL NOT CONFIRMED: {exc}. Check orders and positions in StandX immediately.")
 
@@ -369,7 +361,7 @@ class Dashboard:
             "credit": "Made by @crryptooKerim",
             "market": "Market", "target": "Target BPS", "lower": "Minimum BPS",
             "upper": "Maximum BPS", "margin": "Balance usage %", "leverage": "Leverage",
-            "live": "Enable live orders",
+            "loss": "Emergency loss threshold %", "live": "Enable live orders",
             "start": "Start bot", "stop": "Stop and cancel orders",
             "orders": "Open orders", "logs": "Activity log", "side": "Side",
             "price": "Price", "qty": "Quantity", "type": "Type", "status": "Status",
@@ -382,9 +374,10 @@ class Dashboard:
             "market_wait": "Wait for market limits to load.",
             "bps_error": "BPS must satisfy 0 < min ≤ target ≤ max < 10.",
             "margin_error": "Balance usage must be above 0% and at most 100%.",
+            "loss_error": "Emergency loss threshold must be above 0% and at most 5%.",
             "leverage_error": "Leverage exceeds this market's current limit.",
             "live_title": "Live trading",
-            "live_confirm": "{symbol} · {target} BPS · balance {margin}% · leverage {leverage}x\n\nFilled entries will be closed with reduce-only market orders. Fees and slippage apply. Send real orders?",
+            "live_confirm": "{symbol} · {target} BPS · balance {margin}% · leverage {leverage}x · loss threshold {loss}%\n\nSend real orders?",
             "closed": "The window will close after bot orders are canceled and checked.",
             "position": "Position", "available": "Available", "leverage_word": "Leverage",
             "startup_error": "Could not start", "market_disabled": "Market is not trading",
@@ -397,7 +390,7 @@ class Dashboard:
             "credit": "@crryptooKerim tarafından yapıldı",
             "market": "Pazar", "target": "Hedef BPS", "lower": "Alt BPS",
             "upper": "Üst BPS", "margin": "Bakiye kullanımı %", "leverage": "Kaldıraç",
-            "live": "Canlı emirleri etkinleştir",
+            "loss": "Acil zarar eşiği %", "live": "Canlı emirleri etkinleştir",
             "start": "Botu başlat", "stop": "Durdur ve emirleri iptal et",
             "orders": "Açık emirler", "logs": "İşlem günlüğü", "side": "Yön",
             "price": "Fiyat", "qty": "Miktar", "type": "Tür", "status": "Durum",
@@ -410,9 +403,10 @@ class Dashboard:
             "market_wait": "Pazar limitlerinin yüklenmesini bekleyin.",
             "bps_error": "BPS: 0 < alt ≤ hedef ≤ üst < 10 olmalı.",
             "margin_error": "Bakiye kullanımı %0'dan büyük ve en fazla %100 olmalı.",
+            "loss_error": "Acil zarar eşiği %0'dan büyük ve en fazla %5 olmalı.",
             "leverage_error": "Kaldıraç pazarın güncel sınırını aşamaz.",
             "live_title": "Canlı işlem",
-            "live_confirm": "{symbol} · {target} BPS · bakiye %{margin} · kaldıraç {leverage}x\n\nDolmuş girişler azaltıcı market emirle kapatılacak. Ücret ve kayma olabilir. Gerçek emir gönderilsin mi?",
+            "live_confirm": "{symbol} · {target} BPS · bakiye %{margin} · kaldıraç {leverage}x · zarar eşiği %{loss}\n\nGerçek emir gönderilsin mi?",
             "closed": "Emir iptali ve kontrolü bitince pencere kapanacak.",
             "position": "Pozisyon", "available": "Kullanılabilir", "leverage_word": "Kaldıraç",
             "startup_error": "Başlatılamadı", "market_disabled": "Pazar aktif değil",
@@ -461,6 +455,7 @@ class Dashboard:
         self.margin = tk.StringVar(value="10")
         self.leverage_limit = tk.StringVar(value="—")
         self.market_limit = None
+        self.loss_limit = tk.StringVar(value="2")
         self.live = tk.BooleanVar(value=False)
         self.state = tk.StringVar()
         self.market_data = tk.StringVar(value="Mark: —    Leverage: —    Position: —")
@@ -488,7 +483,8 @@ class Dashboard:
         self.settings_frame.pack(fill="x")
         fields = [("market", self.market), ("target", self.target),
                   ("lower", self.lower), ("upper", self.upper),
-                  ("margin", self.margin), ("leverage", self.leverage_limit)]
+                  ("margin", self.margin), ("leverage", self.leverage_limit),
+                  ("loss", self.loss_limit)]
         self.field_labels, self.inputs = [], []
         for i, (key, variable) in enumerate(fields):
             row, col = divmod(i, 4)
@@ -646,18 +642,21 @@ class Dashboard:
         target, lower, upper = (Decimal(x.get().strip())
                                 for x in (self.target, self.lower, self.upper))
         margin = Decimal(self.margin.get().strip())
+        loss = Decimal(self.loss_limit.get().strip())
         max_leverage = int(self.leverage_limit.get().strip())
         if not (Decimal(0) < lower <= target <= upper < Decimal(10)):
             raise ValueError(self.t("bps_error"))
         if not (Decimal(0) < margin <= Decimal(100)):
             raise ValueError(self.t("margin_error"))
+        if not (Decimal(0) < loss <= Decimal(5)):
+            raise ValueError(self.t("loss_error"))
         if self.market_limit is None or not 1 <= max_leverage <= self.market_limit:
             raise ValueError(self.t("leverage_error"))
-        return target, lower, upper, margin / 100, max_leverage
+        return target, lower, upper, margin / 100, loss / 100, max_leverage
 
     def start(self):
         global SYMBOL, TARGET_BPS, MIN_BPS, MAX_BPS, MAX_MARGIN_FRACTION
-        global MAX_LEVERAGE, DRY_RUN, PREFIX
+        global MAX_LOSS_FRACTION, MAX_LEVERAGE, DRY_RUN, PREFIX
         if self.worker and self.worker.is_alive():
             return
         if self.market_limit is None:
@@ -665,7 +664,7 @@ class Dashboard:
             return
         try:
             (TARGET_BPS, MIN_BPS, MAX_BPS, MAX_MARGIN_FRACTION,
-             MAX_LEVERAGE) = self.settings()
+             MAX_LOSS_FRACTION, MAX_LEVERAGE) = self.settings()
         except (ValueError, ArithmeticError) as exc:
             messagebox.showerror(self.t("invalid"), str(exc))
             return
@@ -674,7 +673,8 @@ class Dashboard:
         PREFIX = "SM-" + SYMBOL.replace("-", "") + "-"
         if not DRY_RUN:
             details = self.t("live_confirm", symbol=SYMBOL, target=TARGET_BPS,
-                             margin=MAX_MARGIN_FRACTION * 100, leverage=MAX_LEVERAGE)
+                             margin=MAX_MARGIN_FRACTION * 100, leverage=MAX_LEVERAGE,
+                             loss=MAX_LOSS_FRACTION * 100)
             if not messagebox.askyesno(self.t("live_title"), details):
                 return
         self.stop_event = threading.Event()
