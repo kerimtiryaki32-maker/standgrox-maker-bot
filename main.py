@@ -286,6 +286,7 @@ class MakerBot:
             time.sleep(0.25)
             if self.get_position()[0] == 0:
                 self.exit_submitted = False
+                self.entry_submitted = False
                 self.active_entry_ids.clear()
                 self.log("Position closed and verified; maker quoting may resume")
                 return
