@@ -1,0 +1,13 @@
+{
+  "name": "standgrox-maker-bot-auth",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": { "login": "node login.js", "sign-key": "node make_sign_key.js" },
+  "dependencies": {
+    "@noble/curves": "^2.0.0",
+    "@scure/base": "^2.0.0",
+    "axios": "^1.0.0",
+    "dotenv": "^17.0.0",
+    "ethers": "^6.0.0"
+  }
+}
