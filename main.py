@@ -378,7 +378,7 @@ class MakerBot:
                 ws.send(json.dumps({"subscribe": {"channel": channel, "symbol": SYMBOL}}))
 
         def listen():
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not self.guard_stop.is_set():
                 self.stream = websocket.WebSocketApp(
                     "wss://perps.standx.com/ws-stream/v1",
                     on_open=on_open,
@@ -991,7 +991,6 @@ class MakerBot:
         except Exception as exc:
             self.log(f"STOPPED: {exc}")
         finally:
-            self.stop_event.set()
             self.guard_stop.set()
             self.guard_wake.set()
             if self.guard_thread is not None:
