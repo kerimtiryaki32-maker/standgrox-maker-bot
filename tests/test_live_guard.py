@@ -126,6 +126,23 @@ class LiveGuardTests(unittest.TestCase):
         self.assertEqual([payload['side'] for path, payload in self.posts], ['buy', 'sell'])
         self.assertNotIn(cid, b.cancel_requests)
 
+    def test_late_cancel_without_active_id_resumes_after_verification(self):
+        b = self.bot
+        cid = main.PREFIX + 'already-settled'
+        # Cancellation races with active-ID reconciliation, leaving an orphan.
+        b.cancel_requests.add(cid)
+        self.assertNotIn(cid, b.active_entry_ids)
+        b.order_state = lambda cl_id: {'cl_ord_id': cl_id, 'status': 'canceled'}
+        b.get_position = lambda: (Decimal(0), Decimal(0))
+        b.all_open_orders = lambda: []
+        b.entry_qty = lambda mark: Decimal('.01')
+        b.price_decimals = 3
+        with patch.object(main.time, 'sleep', lambda seconds: None):
+            b.manage_entry(Decimal('100'), [])
+        self.assertNotIn(cid, b.cancel_requests)
+        self.assertEqual([payload['side'] for path, payload in self.posts],
+                         ['buy', 'sell'])
+
     def test_invalid_book_discards_cached_market(self):
         self.entry()
         self.bot.on_stream_message(json.dumps({
