@@ -4,7 +4,7 @@
 
 Tek bir StandX vadeli işlem pazarında mark fiyata göre iki taraflı post-only limit emirleri yerleştiren yerel Windows panelidir. İlk açılış **simülasyon** modundadır.
 
-> Deneysel işlem yazılımıdır. Canlı emirler gerçekleşebilir, limit çıkış gerçekleşmeyebilir, acil market çıkışı belirlediğiniz eşikten fazla zarar yazabilir. StandX hesabınızı izleyin. Kâr veya Maker Hours garantisi yoktur.
+> Deneysel işlem yazılımıdır. Erken iptale rağmen emirler gerçekleşebilir. Pozisyon azaltıcı piyasa çıkışı taker ücreti ve fiyat kayması yaratır; gecikebilir veya başarısız olabilir. StandX hesabınızı izleyin. Kâr veya Maker Hours garantisi yoktur.
 
 ## Kurulum
 
@@ -22,9 +22,15 @@ Copy-Item .env.example .env
 4. Hatayı terminalde görmek için `py main.py`, pencereli açmak için `run_app.pyw` çalıştırın. `create_shortcut.bat` isteğe bağlı olarak masaüstü kısayolu oluşturur.
 5. Windows'ta `build_windows.bat` isteğe bağlı PyInstaller kurar ve `dist/Standgrox Maker Bot.exe` üretir. EXE kullanırken özel `.env` dosyanız EXE'nin yanında bulunmalıdır. EXE burada Windows üzerinde doğrulanmadı.
 
-Panelden pazar, hedef/alt/üst BPS, bakiye kullanımı, kaldıraç ve acil zarar eşiği seçilir. Canlı işlem için **Canlı emirleri etkinleştir** seçilip onay verilmelidir. İlgili pazarda açık emir veya pozisyon yoksa bot hesap kaldıracını değiştirebilir.
+Panelden pazar, hedef/alt/üst BPS, bakiye kullanımı (%100'e kadar), kaldıraç ve acil zarar eşiği seçilir. Eski panelin görünümü ve ayarları korunur. Varsayılan hedef 5,5 ve alt 5 BPS iken yaklaşan emir 5,25 BPS veya daha yakında çekilir. Karşı taraftaki emir defteri fiyatı 1 BPS yakına gelirse de çekilir. Kontrol üç saniyede bir yapılır; eski 10 saniyelik yenileme beklemesi kaldırılmıştır. Canlı işlem için **Canlı emirleri etkinleştir** seçilip onay verilmelidir. İlgili pazarda açık emir veya pozisyon yoksa bot hesap kaldıracını değiştirebilir. %100 bakiye seçildiğinde borsanın ek ücret rezervi istemesi emri reddettirebilir.
 
-**Durdur** bu botun ilgili pazarda açtığı giriş ve çıkış emirlerini iptal etmeye çalışır ve açık emir sonucunu doğrular. Pozisyonu kapatmaz. İptal doğrulanmazsa StandX hesabını hemen kontrol edin. Çıkış emri iptal edilen açık pozisyonu ayrıca yönetmeniz gerekir. Başka stratejilerin emirlerine dokunulmaz.
+Emir gerçekleşirse diğer bot emri iptal edilir ve pozisyon azaltıcı post-only limit çıkış en iyi satışın (long) veya alışın (short) bir fiyat adımı içine yerleştirilir. Beş saniyede tamamen kapanmazsa limit çıkışın iptali doğrulanıp kalan pozisyon için pozisyon azaltıcı piyasa IOC emri gönderilir. Seçilen acil zarar eşiğine ulaşılırsa doğrudan piyasa çıkışı uygulanır. Çıkış veya iptal doğrulanamazsa bot ikinci çıkışı körlemesine göndermeden durur. Limit emrin hemen dolma garantisi yoktur. Üç saniye boşta bekleme aralığıdır; emir yenileme garantisi değildir. WebSocket üzerinden emir/pozisyon bildirimi veya ayarlanan BPS sınırına yaklaşan fiyat hareketi gelirse bot bu aralığı beklemeden yeniden kontrol eder.
+
+Hedef BPS, alış ve satış fiyatlarını mark fiyatının iki yanına yerleştirir. Alt/Üst BPS, mevcut emrin ne zaman yenileneceğini belirler. Güvenli ve hâlâ 10 BPS bandındaki emir, yeni güvenli fiyat bulunana kadar defterde tutulur. Paneldeki son 60 dakikalık iki taraflı süre, gözlenen açık emirlere dayanan yerel ve ihtiyatlı tahmindir; StandX'in resmi Maker Hours sonucu değildir. StandX'te iki tarafın 10 BPS içinde olması ve saatlik en az 30 dakika korunması gerekir; 42 dakika yükseltilmiş kademedir. Piyasa hareketi, dolum, API gecikmesi veya ret uygunluğu kesintiye uğratabilir.
+
+Tek giriş emri görünüyorsa bot her taramada eksik tarafı dener. 15 saniye sonra bekleyen emirleri doğrular, tek kalan emri iptal eder ve iki tarafı yeniden kurar. Geciken emir veya iptal doğrulanamıyorsa aynı tarafa ikinci emir göndermek yerine bekler. Bu işlem iki taraflı süreyi veya dolum olmayacağını garanti etmez.
+
+**Durdur** bu botun açık emirlerini iptal edip doğrular. Bot oturumunda gerçekleşmiş pozisyon varsa yukarıdaki önce maker çıkışını dener; kapanış doğrulanmazsa StandX hesabını hemen kontrol edin. Başlangıçta zaten açık olan pozisyonlar otomatik işlem görmez. Başka stratejilerin emirlerine dokunulmaz.
 
 ## GitHub dosya kontrolü
 

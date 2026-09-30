@@ -37,14 +37,14 @@ class StandXClient:
 
     def _get(self, path, params=None, auth=True):
         response = requests.get(self.base_url + path, params=params,
-                                headers=self._headers() if auth else {}, timeout=10)
+                                headers=self._headers() if auth else {}, timeout=(2, 4))
         response.raise_for_status()
         return response.json()
 
     def _post_signed(self, path, payload):
         body = json.dumps(payload, separators=(",", ":"))
         response = requests.post(self.base_url + path, data=body,
-                                 headers=self._signed_headers(body), timeout=10)
+                                 headers=self._signed_headers(body), timeout=(3, 8))
         response.raise_for_status()
         return response.json()
 
