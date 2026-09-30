@@ -135,6 +135,46 @@ class LiveGuardTests(unittest.TestCase):
         self.bot.protect_entries_once()
         self.assertEqual(len(self.posts), 1)
 
+    def test_http_backup_unblocks_missing_live_feed(self):
+        b = self.bot
+        b.invalidate_market()
+        b.client._get = lambda path, params, auth: (
+            {'mark_price': '100'} if path.endswith('query_symbol_price') else
+            {'bids': [['99.94', '1']], 'asks': [['100.06', '1']]})
+        b.refresh_public_snapshot()
+        self.assertEqual(b.live_snapshot(),
+                         (Decimal('100'), Decimal('99.94'), Decimal('100.06')))
+        b.price_decimals = 3
+        b.send('buy', Decimal('.01'), Decimal('99.945'))
+        self.assertEqual(len(self.posts), 1)
+
+    def test_slow_http_backup_does_not_mark_old_data_fresh(self):
+        b = self.bot
+        b.invalidate_market()
+        b.client._get = lambda path, params, auth: (
+            {'mark_price': '100'} if path.endswith('query_symbol_price') else
+            {'bids': [['99.94', '1']], 'asks': [['100.06', '1']]})
+        with patch.object(main.time, 'monotonic', side_effect=[10, 14]):
+            with self.assertRaises(main.QuoteUnavailable):
+                b.refresh_public_snapshot()
+        with self.assertRaises(main.QuoteUnavailable):
+            b.live_snapshot()
+
+    def test_http_backup_preserves_newer_stream_data(self):
+        b = self.bot
+        def get(path, params, auth):
+            if path.endswith('query_symbol_price'):
+                b.live_mark = Decimal('101')
+                b.live_book = (Decimal('100.94'), Decimal('101.06'))
+                b.mark_received_at = b.book_received_at = 11
+                return {'mark_price': '100'}
+            return {'bids': [['99.94', '1']], 'asks': [['100.06', '1']]}
+        b.client._get = get
+        with patch.object(main.time, 'monotonic', side_effect=[10, 12]):
+            b.refresh_public_snapshot()
+        self.assertEqual(b.live_mark, Decimal('101'))
+        self.assertEqual(b.live_book, (Decimal('100.94'), Decimal('101.06')))
+
 
 if __name__ == '__main__':
     unittest.main()

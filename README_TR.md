@@ -32,6 +32,8 @@ Tek giriş emri görünüyorsa bot her taramada eksik tarafı dener. 15 saniye s
 
 **Durdur** bu botun açık emirlerini iptal edip doğrular. Bot oturumunda gerçekleşmiş pozisyon varsa yukarıdaki önce maker çıkışını dener; kapanış doğrulanmazsa StandX hesabını hemen kontrol edin. Başlangıçta zaten açık olan pozisyonlar otomatik işlem görmez. Başka stratejilerin emirlerine dokunulmaz.
 
+WebSocket mark veya emir defteri eksik ya da gecikmişse ayrı bir yedek işçi bir saniyelik aralıklarla yeni genel HTTP verilerini almayı dener. Yavaş veya geçersiz verilerle emir gönderilmez; üç saniyelik veri yaşı HTTP isteğinin başlangıcından ölçülür. Daha yeni WebSocket verileri korunur. Bağlantı hatası ve yedek verinin hazır olduğu İşlem günlüğünde gösterilir. HTTP yedeği canlı akıştan yavaştır ve dolumu önleme garantisi vermez.
+
 ## GitHub dosya kontrolü
 
 Kaynak kod ve boş `.env.example` paylaşılır. **`.env` asla paylaşılmaz.** `build/`, `dist/`, `__pycache__/`, `node_modules/`, `*.spec` ve kısayollar üretilen dosyalardır; GitHub'a konmaz. `.gitignore` bunları dışlar ama commit öncesi `git status` inceleyin. Daha önce anahtar commit edildiyse dosyayı sonradan silmek yeterli değildir: anahtarları ve token'ı yenileyin.

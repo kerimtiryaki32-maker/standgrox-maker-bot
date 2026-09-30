@@ -41,6 +41,7 @@ MAX_BPS = Decimal("6")
 LOOP_SECONDS = 3
 ONE_SIDED_RESET_SECONDS = 15
 MARKET_DATA_MAX_AGE = 3.0             # local receipt age; stale feeds pull entries
+MARKET_BACKUP_SECONDS = 1.0          # refresh missing/delayed public feeds over HTTP
 GUARD_CHECK_SECONDS = 0.1
 MAX_MARGIN_FRACTION = Decimal("0.10")  # at most 10% of free cross balance
 MAX_LEVERAGE = 10                       # refuse to run if account is above this
@@ -117,6 +118,7 @@ class MakerBot:
         self.guard_wake = threading.Event()
         self.guard_stop = threading.Event()
         self.guard_thread = None
+        self.market_backup_thread = None
         self.live_mark = None
         self.live_book = None
         self.mark_received_at = 0.0
@@ -193,6 +195,28 @@ class MakerBot:
         self.guard_wake.set()
         self.wake_event.set()
 
+    def refresh_public_snapshot(self):
+        """Refresh delayed feeds without treating old HTTP responses as fresh."""
+        started = time.monotonic()
+        price = unwrap(self.client._get(
+            "/api/query_symbol_price", {"symbol": SYMBOL}, auth=False))
+        mark = D(price["mark_price"])
+        book = self.book_top(unwrap(self.client._get(
+            "/api/query_depth_book", {"symbol": SYMBOL}, auth=False)))
+        if (not mark.is_finite() or mark <= 0
+                or time.monotonic() - started >= MARKET_DATA_MAX_AGE):
+            raise QuoteUnavailable("HTTP market snapshot invalid or too slow")
+        with self.market_lock:
+            # Never replace a newer WebSocket update with an earlier HTTP read.
+            if self.mark_received_at <= started:
+                self.live_mark = mark
+                self.mark_received_at = started
+            if self.book_received_at <= started:
+                self.live_book = book
+                self.book_received_at = started
+        self.guard_wake.set()
+        self.wake_event.set()
+
     def on_stream_message(self, raw):
         try:
             event = json.loads(raw)
@@ -201,6 +225,7 @@ class MakerBot:
                 return
             if channel == "auth":
                 if data.get("code") != 200:
+                    self.log(f"WebSocket authentication failed (code {data.get('code')}); reconnecting")
                     self.invalidate_market()
                     if self.stream is not None:
                         self.stream.close()
@@ -306,8 +331,45 @@ class MakerBot:
         self.guard_thread = threading.Thread(target=protect, daemon=True)
         self.guard_thread.start()
 
+        def public_backup():
+            announced = False
+            last_error_at = 0.0
+            while not self.guard_stop.is_set():
+                now = time.monotonic()
+                retry_delay = MARKET_BACKUP_SECONDS
+                with self.market_lock:
+                    needs_refresh = (self.live_mark is None or self.live_book is None
+                        or now - self.mark_received_at >= MARKET_BACKUP_SECONDS
+                        or now - self.book_received_at >= MARKET_BACKUP_SECONDS)
+                if needs_refresh:
+                    try:
+                        self.refresh_public_snapshot()
+                        if not announced:
+                            self.log("Fresh HTTP market backup ready; WebSocket monitoring remains active")
+                            announced = True
+                    except Exception as exc:
+                        if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+                            retry_delay = 5.0
+                        if time.monotonic() - last_error_at >= 10:
+                            self.log(f"Market backup unavailable: {exc}; new entries blocked until fresh data")
+                            last_error_at = time.monotonic()
+                self.guard_stop.wait(retry_delay)
+
+        self.market_backup_thread = threading.Thread(target=public_backup, daemon=True)
+        self.market_backup_thread.start()
+
+        def on_error(ws, error):
+            self.invalidate_market()
+            self.log(f"WebSocket connection error: {error}; fresh HTTP backup will retry")
+
+        def on_close(ws, code, message):
+            self.invalidate_market()
+            if not self.stop_event.is_set():
+                self.log(f"WebSocket disconnected (code {code}); reconnecting with HTTP backup")
+
         def on_open(ws):
             self.invalidate_market()
+            self.log("WebSocket connected; subscribing to mark, depth, orders and positions")
             ws.send(json.dumps({"auth": {
                 "token": self.client.token,
                 "streams": [{"channel": "position"}, {"channel": "order"}],
@@ -321,8 +383,8 @@ class MakerBot:
                     "wss://perps.standx.com/ws-stream/v1",
                     on_open=on_open,
                     on_message=lambda ws, raw: self.on_stream_message(raw),
-                    on_close=lambda *args: self.invalidate_market(),
-                    on_error=lambda *args: self.invalidate_market(),
+                    on_close=on_close,
+                    on_error=on_error,
                 )
                 try:
                     self.stream.run_forever(ping_interval=20, ping_timeout=10)
@@ -903,6 +965,8 @@ class MakerBot:
             self.guard_wake.set()
             if self.guard_thread is not None:
                 self.guard_thread.join(timeout=10)
+            if self.market_backup_thread is not None:
+                self.market_backup_thread.join(timeout=10)
             if self.stream is not None:
                 self.stream.close()
             # Shutdown must account for a fill racing with the final cancellation.

@@ -32,6 +32,8 @@ If only one entry order remains visible, the bot retries the missing side each s
 
 **Stop** cancels and verifies bot-owned open orders. If an entry filled during this bot session, it attempts the maker-first exit described above; an unconfirmed close still requires immediate inspection in StandX. Positions already open before startup are never traded automatically. Other strategies' orders remain untouched.
 
+If the WebSocket mark or book is missing or delayed, an independent backup worker retries fresh public HTTP snapshots at one-second intervals. Slow or invalid snapshots remain blocked; the three-second age limit is measured from the start of the HTTP read. Newer WebSocket values are preserved. Connection errors and backup readiness appear in Activity log. The backup is slower than streaming and cannot prevent fills.
+
 ## Files and privacy
 
 GitHub should contain source files, documentation, and the empty `.env.example`. Never publish `.env`, wallet keys, JWTs, signing keys, `build/`, `dist/`, `__pycache__/`, `node_modules/`, or `.spec` files. `.gitignore` excludes them by default, but check `git status` before every commit. If a secret was ever committed, deleting the file later does not revoke it: rotate the keys and token.
