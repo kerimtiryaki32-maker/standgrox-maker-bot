@@ -481,7 +481,10 @@ class MakerBot:
     def reconcile_missing_entries(self, orders):
         seen = {str(x.get("cl_ord_id")) for x in self.owned(orders)
                 if not x.get("reduce_only")}
-        missing = self.active_entry_ids - seen
+        # A late cancellation from an older snapshot may outlive active_entry_ids.
+        # Verify every pending cancellation by order ID before allowing new quotes.
+        with self.market_lock:
+            missing = (self.active_entry_ids | self.cancel_requests) - seen
         if not missing or DRY_RUN:
             return True
         states = {}
@@ -693,8 +696,13 @@ class MakerBot:
         if not self.reconcile_missing_entries(orders):
             return
         with self.market_lock:
-            if self.cancel_requests:
-                return
+            pending_cancels = len(self.cancel_requests)
+        if pending_cancels:
+            now = time.monotonic()
+            if now - getattr(self, "last_pending_cancel_log", 0.0) >= 5:
+                self.log(f"Waiting for terminal confirmation of {pending_cancels} entry cancellation(s)")
+                self.last_pending_cancel_log = now
+            return
         if not DRY_RUN and self.get_position()[0] != 0:
             return
         owned = self.owned(orders)
