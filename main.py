@@ -911,6 +911,36 @@ class MakerBot:
                 return
         raise RuntimeError("Exit unconfirmed or partial; bot stopped. Check StandX position immediately")
 
+    def cancel_and_verify_on_stop(self):
+        """Retry transport failures during cleanup; never resend a new order."""
+        if DRY_RUN:
+            self.log("Simulation stopped; no live orders were sent.")
+            return self.get_position()
+        for attempt in range(6):
+            try:
+                for _ in range(3):
+                    owned = self.owned(self.all_open_orders())
+                    if not owned:
+                        break
+                    for order in owned:
+                        self.cancel(order)
+                remaining = self.owned(self.all_open_orders())
+                if remaining:
+                    raise RuntimeError(f"{len(remaining)} bot orders still open")
+                position = self.get_position()
+                self.log("All bot-owned open orders canceled and verified.")
+                return position
+            except requests.RequestException as exc:
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                if code is not None and code != 429 and code < 500:
+                    raise
+                if attempt == 5:
+                    raise
+                delay = min(2 ** attempt, 5)
+                self.log(f"Cleanup connection failure; retry {attempt + 2}/6 in {delay}s. "
+                         "New entries remain disabled; inspect StandX orders and position.")
+                time.sleep(delay)
+
     def run(self):
         try:
             startup_orders = self.all_open_orders()
@@ -961,6 +991,7 @@ class MakerBot:
         except Exception as exc:
             self.log(f"STOPPED: {exc}")
         finally:
+            self.stop_event.set()
             self.guard_stop.set()
             self.guard_wake.set()
             if self.guard_thread is not None:
@@ -969,23 +1000,10 @@ class MakerBot:
                 self.market_backup_thread.join(timeout=10)
             if self.stream is not None:
                 self.stream.close()
-            # Shutdown must account for a fill racing with the final cancellation.
+            # Retry cancel/query transport failures only. New-order and exit
+            # submissions stay outside the retry loop to prevent duplicate exits.
             try:
-                if DRY_RUN:
-                    self.log("Simulation stopped; no live orders were sent.")
-                else:
-                    for _ in range(3):
-                        orders = self.all_open_orders()
-                        owned = self.owned(orders)
-                        if not owned:
-                            break
-                        for order in owned:
-                            self.cancel(order)
-                    remaining = self.owned(self.all_open_orders())
-                    if remaining:
-                        raise RuntimeError(f"{len(remaining)} bot orders still open")
-                    self.log("All bot-owned open orders canceled and verified.")
-                position_qty, _ = self.get_position()
+                position_qty, _ = self.cancel_and_verify_on_stop()
                 if position_qty and self.entry_submitted and not self.exit_submitted:
                     self.log("Position during shutdown; attempting maker-first reduce-only exit")
                     self.close_filled_position()
