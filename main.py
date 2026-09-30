@@ -40,6 +40,8 @@ MIN_BPS = Decimal("5")
 MAX_BPS = Decimal("6")
 LOOP_SECONDS = 3
 ONE_SIDED_RESET_SECONDS = 15
+MARKET_DATA_MAX_AGE = 3.0             # local receipt age; stale feeds pull entries
+GUARD_CHECK_SECONDS = 0.1
 MAX_MARGIN_FRACTION = Decimal("0.10")  # at most 10% of free cross balance
 MAX_LEVERAGE = 10                       # refuse to run if account is above this
 EARLY_PULL_BPS = Decimal("0.25")        # pull at MIN_BPS + this buffer
@@ -110,7 +112,18 @@ class MakerBot:
         self.wake_event = threading.Event()
         self.stream = None
         self.quote_snapshot = {}
-        self.last_price_wake = 0.0
+        self.market_lock = threading.RLock()
+        self.entry_io_lock = threading.RLock()
+        self.guard_wake = threading.Event()
+        self.guard_stop = threading.Event()
+        self.guard_thread = None
+        self.live_mark = None
+        self.live_book = None
+        self.mark_received_at = 0.0
+        self.book_received_at = 0.0
+        self.guard_entries = {}
+        self.cancel_requests = set()
+        self.guard_position = Decimal(0)
         self.client = StandXClient()
         self.info = self.get_info()
         self.price_decimals = int(self.info["price_tick_decimals"])
@@ -152,55 +165,170 @@ class MakerBot:
             raise RuntimeError(f"Market is not trading: {data.get('status')}")
         return data
 
+    @staticmethod
+    def book_top(data):
+        bids = [D(level[0]) for level in data["bids"] if D(level[1]) > 0]
+        asks = [D(level[0]) for level in data["asks"] if D(level[1]) > 0]
+        if not bids or not asks:
+            raise QuoteUnavailable("Empty order book")
+        best_bid, best_ask = max(bids), min(asks)
+        if not (best_bid.is_finite() and best_ask.is_finite()
+                and Decimal(0) < best_bid < best_ask):
+            raise QuoteUnavailable("Crossed or invalid order book")
+        return best_bid, best_ask
+
+    def live_snapshot(self):
+        now = time.monotonic()
+        with self.market_lock:
+            if (self.live_mark is None or self.live_book is None
+                    or now - self.mark_received_at > MARKET_DATA_MAX_AGE
+                    or now - self.book_received_at > MARKET_DATA_MAX_AGE):
+                raise QuoteUnavailable("Waiting for fresh live mark and order book")
+            return self.live_mark, *self.live_book
+
+    def invalidate_market(self):
+        with self.market_lock:
+            self.live_mark = None
+            self.live_book = None
+        self.guard_wake.set()
+        self.wake_event.set()
+
+    def on_stream_message(self, raw):
+        try:
+            event = json.loads(raw)
+            channel, data = event.get("channel"), event.get("data")
+            if not isinstance(data, dict):
+                return
+            if channel == "auth":
+                if data.get("code") != 200:
+                    self.invalidate_market()
+                    if self.stream is not None:
+                        self.stream.close()
+                return
+            if data.get("symbol", event.get("symbol")) != SYMBOL:
+                return
+            if channel == "price":
+                mark = D(data["mark_price"])
+                if not mark.is_finite() or mark <= 0:
+                    raise QuoteUnavailable("Invalid live mark")
+                with self.market_lock:
+                    self.live_mark = mark
+                    self.mark_received_at = time.monotonic()
+                self.guard_wake.set()
+            elif channel == "depth_book":
+                book = self.book_top(data)
+                with self.market_lock:
+                    self.live_book = book
+                    self.book_received_at = time.monotonic()
+                self.guard_wake.set()
+            elif channel == "position":
+                with self.market_lock:
+                    self.guard_position = D(data["qty"])
+                self.guard_wake.set()
+                self.wake_event.set()
+            elif channel == "order":
+                cl_id = str(data.get("cl_ord_id", ""))
+                if cl_id.startswith(PREFIX) and not data.get("reduce_only"):
+                    with self.market_lock:
+                        if str(data.get("status", "")).lower() in (
+                                "filled", "canceled", "cancelled", "rejected"):
+                            self.guard_entries.pop(cl_id, None)
+                            self.cancel_requests.discard(cl_id)
+                        elif cl_id in self.guard_entries:
+                            self.guard_entries[cl_id].update(data)
+                self.guard_wake.set()
+                self.wake_event.set()
+        except (QuoteUnavailable, ValueError, ArithmeticError, AttributeError, KeyError, TypeError):
+            # Malformed market data must never leave old quotes marked fresh.
+            self.invalidate_market()
+
+    def request_entry_cancel(self, cl_id, reason):
+        with self.market_lock:
+            if cl_id in self.cancel_requests:
+                return
+            self.cancel_requests.add(cl_id)
+        try:
+            if not DRY_RUN:
+                with self.entry_io_lock:
+                    unwrap(self.client._post_signed(
+                        "/api/cancel_order", {"cl_ord_id": cl_id}))
+            self.log(f"Entry cancel requested ({reason}): {cl_id}")
+            self.wake_event.set()
+        except Exception:
+            with self.market_lock:
+                self.cancel_requests.discard(cl_id)
+            raise
+
+    def protect_entries_once(self):
+        with self.market_lock:
+            entries = list(self.guard_entries.items())
+            position = self.guard_position
+        if not entries:
+            return
+        try:
+            mark, best_bid, best_ask = self.live_snapshot()
+            reason = None
+        except QuoteUnavailable:
+            reason = "live market data unavailable"
+        for cl_id, order in entries:
+            why = reason
+            if position != 0:
+                why = "position detected"
+            if why is None:
+                side, price = order["side"], D(order["price"])
+                distance = ((mark - price) if side == "buy" else
+                            (price - mark)) / mark * 10000
+                if distance <= MIN_BPS + EARLY_PULL_BPS:
+                    why = "mark approached entry"
+                elif distance > MAX_BPS:
+                    why = "entry outside configured band"
+                elif self.too_close_to_book(side, price, mark, best_bid, best_ask):
+                    why = "opposite book approached entry"
+            if why:
+                self.request_entry_cancel(cl_id, why)
+
     def start_stream(self):
         if websocket is None:
-            self.log("WebSocket unavailable; checking fills by polling. Install requirements for faster updates.")
-            return
+            raise RuntimeError("websocket-client is required; install requirements.txt")
+
+        def protect():
+            while not self.guard_stop.is_set():
+                self.guard_wake.wait(GUARD_CHECK_SECONDS)
+                self.guard_wake.clear()
+                try:
+                    self.protect_entries_once()
+                except Exception as exc:
+                    self.log(f"Live guard cancellation failed: {exc}; stopping for cleanup")
+                    self.stop_event.set()
+                    self.wake_event.set()
+                    return
+
+        self.guard_thread = threading.Thread(target=protect, daemon=True)
+        self.guard_thread.start()
 
         def on_open(ws):
+            self.invalidate_market()
             ws.send(json.dumps({"auth": {
                 "token": self.client.token,
                 "streams": [{"channel": "position"}, {"channel": "order"}],
             }}))
-            ws.send(json.dumps({"subscribe": {"channel": "price", "symbol": SYMBOL}}))
-
-        def on_message(ws, raw):
-            try:
-                event = json.loads(raw)
-                if event.get("channel") == "auth" and event.get("data", {}).get("code") != 200:
-                    ws.close()
-                elif event.get("channel") in ("position", "order"):
-                    data = event.get("data")
-                    if isinstance(data, dict) and data.get("symbol") == SYMBOL:
-                        self.wake_event.set()
-                elif event.get("channel") == "price":
-                    data = event.get("data")
-                    if not isinstance(data, dict) or data.get("symbol") != SYMBOL:
-                        return
-                    mark = D(data["mark_price"])
-                    quotes = self.quote_snapshot
-                    for side, price in quotes.items():
-                        distance = ((mark - price) if side == "buy" else
-                                    (price - mark)) / mark * 10000
-                        if distance <= MIN_BPS + EARLY_PULL_BPS or distance > MAX_BPS:
-                            now = time.monotonic()
-                            if now - self.last_price_wake >= 1.5:
-                                self.last_price_wake = now
-                                self.wake_event.set()
-                            break
-            except (ValueError, ArithmeticError, AttributeError, KeyError):
-                pass
+            for channel in ("price", "depth_book"):
+                ws.send(json.dumps({"subscribe": {"channel": channel, "symbol": SYMBOL}}))
 
         def listen():
             while not self.stop_event.is_set():
                 self.stream = websocket.WebSocketApp(
                     "wss://perps.standx.com/ws-stream/v1",
-                    on_open=on_open, on_message=on_message,
+                    on_open=on_open,
+                    on_message=lambda ws, raw: self.on_stream_message(raw),
+                    on_close=lambda *args: self.invalidate_market(),
+                    on_error=lambda *args: self.invalidate_market(),
                 )
                 try:
                     self.stream.run_forever(ping_interval=20, ping_timeout=10)
                 except Exception as exc:
                     self.log(f"Order stream interrupted: {exc}")
+                self.invalidate_market()
                 if self.stop_event.wait(2):
                     break
 
@@ -213,6 +341,10 @@ class MakerBot:
         return data
 
     def get_mark(self):
+        with self.market_lock:
+            if (self.live_mark is not None
+                    and time.monotonic() - self.mark_received_at <= MARKET_DATA_MAX_AGE):
+                return self.live_mark
         return D(self.client.get_mark_price(SYMBOL))
 
     def get_position(self):
@@ -226,7 +358,14 @@ class MakerBot:
             if row.get("symbol") == SYMBOL:
                 if "qty" not in row:
                     raise RuntimeError(f"Position quantity missing: {row}")
-                return D(row.get("qty", "0")), D(row.get("entry_price", "0"))
+                qty = D(row["qty"])
+                with self.market_lock:
+                    self.guard_position = qty
+                if qty:
+                    self.guard_wake.set()
+                return qty, D(row.get("entry_price", "0"))
+        with self.market_lock:
+            self.guard_position = Decimal(0)
         return Decimal(0), Decimal(0)
 
     def all_open_orders(self):
@@ -241,6 +380,12 @@ class MakerBot:
             x["side"]: D(x["price"]) for x in self.owned(orders)
             if not x.get("reduce_only") and x.get("side") in ("buy", "sell")
         }
+        with self.market_lock:
+            for order in self.owned(orders):
+                cl_id = str(order.get("cl_ord_id", ""))
+                if not order.get("reduce_only") and cl_id in self.active_entry_ids:
+                    self.guard_entries[cl_id] = dict(order)
+        self.guard_wake.set()
         return orders
 
     def publish_status(self):
@@ -310,21 +455,21 @@ class MakerBot:
         self.active_entry_ids.difference_update(missing)
         for cl_id in missing:
             self.pending_entry_cancels.pop(cl_id, None)
+            with self.market_lock:
+                self.guard_entries.pop(cl_id, None)
+                self.cancel_requests.discard(cl_id)
         self.log("Entry orders settled and flat verified; maker quotes resume")
         return True
 
     def depth(self):
+        with self.market_lock:
+            if (self.live_book is not None
+                    and time.monotonic() - self.book_received_at <= MARKET_DATA_MAX_AGE):
+                return self.live_book
         data = unwrap(self.client._get(
             "/api/query_depth_book", {"symbol": SYMBOL}, auth=False
         ))
-        bids = [D(level[0]) for level in data["bids"] if D(level[1]) > 0]
-        asks = [D(level[0]) for level in data["asks"] if D(level[1]) > 0]
-        if not bids or not asks:
-            raise QuoteUnavailable("Empty order book")
-        best_bid, best_ask = max(bids), min(asks)
-        if best_bid >= best_ask:
-            raise QuoteUnavailable("Crossed or stale order book")
-        return best_bid, best_ask
+        return self.book_top(data)
 
     def too_close_to_book(self, side, price, mark, best_bid, best_ask):
         gap = best_ask - price if side == "buy" else price - best_bid
@@ -344,25 +489,35 @@ class MakerBot:
             self.log(f"[SIMULATION] new_order {payload}")
             return None
         if not reduce_only:
-            # The mark and book can move while balance and order data are fetched.
-            fresh_mark = self.get_mark()
-            try:
-                best_bid, best_ask = self.depth()
-            except QuoteUnavailable as exc:
-                self.log(f"Skipping stale {side} quote: {exc}")
-                return None
-            distance = ((fresh_mark - price) if side == "buy"
-                        else (price - fresh_mark)) / fresh_mark * 10000
-            if (distance <= MIN_BPS + EARLY_PULL_BPS
-                    or self.too_close_to_book(side, price, fresh_mark,
-                                              best_bid, best_ask)):
-                self.log(f"Skipped stale {side} quote; recalculating next cycle")
-                return None
-            # The exchange may accept the order even if the HTTP call times out.
-            self.entry_submitted = True
-            self.active_entry_ids.add(cl_id)
-        self.log(f"Sending {side} {'exit' if reduce_only else 'entry'}: {qty} @ {price}")
-        unwrap(self.client._post_signed("/api/new_order", payload))
+            # Recheck after waiting for other writes. The guard can cancel while
+            # the main loop is fetching account data, but writes are serialized.
+            with self.entry_io_lock:
+                try:
+                    fresh_mark, best_bid, best_ask = self.live_snapshot()
+                except QuoteUnavailable as exc:
+                    self.log(f"Entry skipped: {exc}")
+                    return None
+                with self.market_lock:
+                    pending_cancel = bool(self.cancel_requests)
+                    position = self.guard_position
+                distance = ((fresh_mark - price) if side == "buy"
+                            else (price - fresh_mark)) / fresh_mark * 10000
+                if (self.stop_event.is_set() or pending_cancel or position != 0
+                        or not MIN_BPS + EARLY_PULL_BPS < distance <= MAX_BPS
+                        or self.too_close_to_book(side, price, fresh_mark,
+                                                  best_bid, best_ask)):
+                    self.log(f"Skipped unsafe or pending {side} entry; retrying")
+                    return None
+                self.entry_submitted = True
+                self.active_entry_ids.add(cl_id)
+                with self.market_lock:
+                    self.guard_entries[cl_id] = dict(payload)
+                self.log(f"Sending {side} entry: {qty} @ {price}")
+                unwrap(self.client._post_signed("/api/new_order", payload))
+            self.guard_wake.set()
+        else:
+            self.log(f"Sending {side} exit: {qty} @ {price}")
+            unwrap(self.client._post_signed("/api/new_order", payload))
         # The exchange processes accepted orders asynchronously. Keep the ID
         # pending and send the opposite quote without a blocking confirmation
         # loop. Reconcile it before any future replacement or duplicate.
@@ -372,9 +527,13 @@ class MakerBot:
         if DRY_RUN:
             self.log(f"[SIMULATION] cancel {order.get('cl_ord_id')}")
             return
-        unwrap(self.client._post_signed(
-            "/api/cancel_order", {"order_id": int(order["id"])}
-        ))
+        cl_id = str(order.get("cl_ord_id", ""))
+        if cl_id.startswith(PREFIX) and not order.get("reduce_only"):
+            self.request_entry_cancel(cl_id, "quote replacement or cleanup")
+        else:
+            unwrap(self.client._post_signed(
+                "/api/cancel_order", {"order_id": int(order["id"])}
+            ))
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if not any(x.get("id") == order["id"] for x in self.all_open_orders()):
@@ -464,8 +623,16 @@ class MakerBot:
         return qty
 
     def manage_entry(self, mark, orders):
+        try:
+            mark, best_bid, best_ask = self.live_snapshot()
+        except QuoteUnavailable as exc:
+            self.log(str(exc))
+            return
         if not self.reconcile_missing_entries(orders):
             return
+        with self.market_lock:
+            if self.cancel_requests:
+                return
         if not DRY_RUN and self.get_position()[0] != 0:
             return
         owned = self.owned(orders)
@@ -485,9 +652,8 @@ class MakerBot:
                 return
             if not DRY_RUN and self.get_position()[0] != 0:
                 return
-            mark = self.get_mark()
             try:
-                best_bid, best_ask = self.depth()
+                mark, best_bid, best_ask = self.live_snapshot()
             except QuoteUnavailable as exc:
                 self.log(f"Waiting for a valid order book: {exc}")
                 return
@@ -512,9 +678,6 @@ class MakerBot:
                 except QuoteUnavailable:
                     candidate_safe = False
                 if not candidate_safe:
-                    if Decimal(0) < distance < Decimal(10) and current_book_safe:
-                        self.log(f"Keeping eligible {side} quote until a safe replacement exists")
-                        continue
                     self.cancel(current)
                     return
                 self.cancel(current)
@@ -523,8 +686,7 @@ class MakerBot:
             # Only fetch a new snapshot when an existing order was canceled.
             try:
                 if current is not None:
-                    mark = self.get_mark()
-                    best_bid, best_ask = self.depth()
+                    mark, best_bid, best_ask = self.live_snapshot()
                 book = (best_bid, best_ask)
                 bid, ask = self.entry_prices(mark, book)
             except QuoteUnavailable as exc:
@@ -730,11 +892,17 @@ class MakerBot:
                     self.publish_status()
                     if not DRY_RUN and self.get_position()[0] != 0:
                         continue
-                self.wake_event.wait(LOOP_SECONDS)
+                with self.market_lock:
+                    pending_cancel = bool(self.cancel_requests)
+                self.wake_event.wait(0.25 if pending_cancel else LOOP_SECONDS)
                 self.wake_event.clear()
         except Exception as exc:
             self.log(f"STOPPED: {exc}")
         finally:
+            self.guard_stop.set()
+            self.guard_wake.set()
+            if self.guard_thread is not None:
+                self.guard_thread.join(timeout=10)
             if self.stream is not None:
                 self.stream.close()
             # Shutdown must account for a fill racing with the final cancellation.
