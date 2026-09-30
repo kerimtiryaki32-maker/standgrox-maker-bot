@@ -224,7 +224,7 @@ class MakerBot:
             if not isinstance(data, dict):
                 return
             if channel == "auth":
-                if data.get("code") != 200:
+                if data.get("code") not in (0, 200, "0", "200"):
                     self.log(f"WebSocket authentication failed (code {data.get('code')}); reconnecting")
                     self.invalidate_market()
                     if self.stream is not None:
