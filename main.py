@@ -1,6 +1,6 @@
 """StandX single-market maker bot with a local desktop dashboard.
 
-Requires the existing standx_client.py and its .env credentials.
+Credentials are entered through the desktop login screen.
 Run with: py main.py
 """
 
@@ -106,7 +106,7 @@ class UptimeMeter:
 
 
 class MakerBot:
-    def __init__(self, log=print, status=None, stop_event=None):
+    def __init__(self, log=print, status=None, stop_event=None, client=None):
         self.log = log
         self.status = status or (lambda data: None)
         self.stop_event = stop_event or threading.Event()
@@ -126,7 +126,7 @@ class MakerBot:
         self.guard_entries = {}
         self.cancel_requests = set()
         self.guard_position = Decimal(0)
-        self.client = StandXClient()
+        self.client = client if client is not None else StandXClient()
         self.info = self.get_info()
         self.price_decimals = int(self.info["price_tick_decimals"])
         self.qty_decimals = int(self.info["qty_tick_decimals"])
@@ -1104,7 +1104,9 @@ class Dashboard:
         },
     }
 
-    def __init__(self):
+    def __init__(self, credentials=None, language="EN"):
+        self.credentials = credentials
+        self.return_to_login = False
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -1137,7 +1139,7 @@ class Dashboard:
         self.stop_event = threading.Event()
         self.closing = False
         self.last_stop_reason = None
-        self.language = tk.StringVar(value="EN")
+        self.language = tk.StringVar(value=language)
         self.market = tk.StringVar(value="BTC-USD")
         self.target = tk.StringVar(value="5.5")
         self.lower = tk.StringVar(value="5")
@@ -1173,6 +1175,10 @@ class Dashboard:
         self.credit.pack(anchor="e", pady=(8, 0))
         self.credit.bind("<Button-1>", lambda _event: webbrowser.open(
             "https://x.com/crryptooKerim"))
+        self.logout_button = ttk.Button(upper_right, command=self.logout)
+        self.logout_button.pack(anchor="e", pady=(8, 0))
+        self.forget_credentials_button = ttk.Button(upper_right, command=self.forget_credentials)
+        self.forget_credentials_button.pack(anchor="e", pady=(5, 0))
         self.settings_frame = ttk.LabelFrame(outer, padding=15)
         self.settings_frame.pack(fill="x")
         fields = [("market", self.market), ("target", self.target),
@@ -1233,10 +1239,34 @@ class Dashboard:
         self.load_market_info()
         self.root.after(200, self.poll)
 
+    def logout(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Standgrox Maker Bot",
+                "Stop the bot and wait for cleanup before signing out." if self.language.get() == "EN" else
+                "Çıkıştan önce botu durdurun ve temizliğin tamamlanmasını bekleyin.")
+            return
+        self.return_to_login = True
+        self.credentials = None
+        self.root.destroy()
+
+    def forget_credentials(self):
+        from credentials import CredentialStore
+        try:
+            CredentialStore().delete()
+            messagebox.showinfo("Standgrox Maker Bot",
+                "Saved credentials deleted. Current session and .env are unchanged." if self.language.get() == "EN" else
+                "Kayıtlı bilgiler silindi. Mevcut oturum ve .env değiştirilmedi.")
+        except Exception:
+            messagebox.showerror("Standgrox Maker Bot",
+                "Secure storage could not be accessed." if self.language.get() == "EN" else
+                "Güvenli depoya erişilemedi.")
+
     def t(self, key, **values):
         return self.TEXT[self.language.get()][key].format(**values)
 
     def translate(self):
+        self.logout_button.configure(text="Sign out" if self.language.get() == "EN" else "Çıkış yap")
+        self.forget_credentials_button.configure(text="Delete saved login" if self.language.get() == "EN" else "Kayıtlı girişi sil")
         self.subtitle.configure(text=self.t("subtitle"))
         self.credit.configure(text=self.t("credit"))
         self.settings_frame.configure(text="  " + self.t("settings") + "  ")
@@ -1384,6 +1414,7 @@ class Dashboard:
         self.order_counts.set(self.t("counts", open=0, filled=0, minutes=0.0))
         self.state.set(self.t("connecting"))
         self.start_button.configure(state="disabled")
+        self.logout_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.live_check.configure(state="disabled")
         for widget in self.inputs:
@@ -1393,7 +1424,7 @@ class Dashboard:
 
     def work(self):
         try:
-            client = StandXClient()
+            client = StandXClient(token=self.credentials.token, sign_key_hex=self.credentials.sign_key_hex) if self.credentials else StandXClient()
             configured = unwrap(client._get(
                 "/api/query_position_config", {"symbol": SYMBOL}, auth=True))
             if isinstance(configured, list):
@@ -1429,7 +1460,7 @@ class Dashboard:
                 return
             bot = MakerBot(log=lambda msg: self.events.put(("log", str(msg))),
                            status=lambda data: self.events.put(("status", data)),
-                           stop_event=self.stop_event)
+                           stop_event=self.stop_event, client=client)
             self.bot = bot
             self.events.put(("state", "running" if not DRY_RUN else "simulation"))
             bot.run()
@@ -1457,6 +1488,8 @@ class Dashboard:
         self.root.destroy()
 
     def write_log(self, message):
+        if self.credentials:
+            message = str(message).replace(self.credentials.token, "[redacted]").replace(self.credentials.sign_key_hex, "[redacted]")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{time.strftime('%H:%M:%S')}  {message}\n")
         self.log_box.see("end")
@@ -1492,6 +1525,7 @@ class Dashboard:
                             self.t("exit") if order.get("reduce_only") else self.t("entry"),
                             order.get("status")))
                 elif kind == "finished":
+                    self.logout_button.configure(state="normal")
                     self.state.set(self.last_stop_reason or self.t("stopped"))
                     self.start_button.configure(state="normal" if self.market_limit else "disabled")
                     self.stop_button.configure(state="disabled")
@@ -1522,5 +1556,18 @@ class Dashboard:
         self.root.mainloop()
 
 
+def launch_app():
+    from login_ui import LoginWindow
+    language = "EN"
+    while True:
+        credentials, language = LoginWindow(bundled_asset("icon.png"), language).run()
+        if credentials is None:
+            return
+        dashboard = Dashboard(credentials=credentials, language=language)
+        dashboard.run()
+        if not dashboard.return_to_login:
+            return
+
+
 if __name__ == "__main__":
-    Dashboard().run()
+    launch_app()

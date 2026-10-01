@@ -13,10 +13,10 @@ load_dotenv()
 
 
 class StandXClient:
-    def __init__(self):
+    def __init__(self, token=None, sign_key_hex=None):
         self.base_url = "https://perps.standx.com"
-        self.token = os.getenv("STANDX_TOKEN", "").strip()
-        sign_key_hex = os.getenv("STANDX_SIGN_KEY_HEX", "").strip()
+        self.token = (os.getenv("STANDX_TOKEN", "") if token is None else token).strip()
+        sign_key_hex = (os.getenv("STANDX_SIGN_KEY_HEX", "") if sign_key_hex is None else sign_key_hex).strip()
         self.session_id = os.getenv("STANDX_SESSION_ID", "").strip() or str(uuid.uuid4())
         if not self.token:
             raise ValueError("STANDX_TOKEN is missing from .env")

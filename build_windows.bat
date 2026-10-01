@@ -5,11 +5,11 @@ py -m pip install -r requirements.txt
 if errorlevel 1 goto :failed
 py -m pip install pyinstaller
 if errorlevel 1 goto :failed
-py -m PyInstaller --noconfirm --clean --onefile --windowed --name "Standgrox Maker Bot" --icon "icon.ico" --add-data "icon.png;." --add-data "icon.ico;." main.py
+py -m PyInstaller --noconfirm --clean --onefile --windowed --hidden-import keyring.backends.Windows --name "Standgrox Maker Bot" --icon "icon.ico" --add-data "icon.png;." --add-data "icon.ico;." main.py
 if errorlevel 1 goto :failed
 echo.
 echo Done. The app is in the dist folder.
-echo Keep .env beside the .exe; do not share it.
+echo Enter your own token and bot signing key in the login screen. Do not share credentials.
 pause
 exit /b 0
 :failed

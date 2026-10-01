@@ -16,11 +16,13 @@ npm install
 Copy-Item .env.example .env
 ```
 
-1. Run `node make_sign_key.js` and copy its `STANDX_SIGN_KEY_HEX=...` output to your **local** `.env`.
+1. Run `node make_sign_key.js` and copy its `STANDX_SIGN_KEY_HEX=...` output to your **local** `.env` for the initial login helper.
 2. Add `EVM_WALLET_PRIVATE_KEY=...` to the local `.env` for login. This is highly sensitive. Never commit or share it. You can remove the line once the token is generated.
 3. Run `node login.js`, then copy `STANDX_TOKEN=...` to `.env`. If authentication returns 401, log in again to refresh the token. Keep the signing key for the same session.
-4. Run `py main.py` to see startup errors or double-click `run_app.pyw` for a console-free window. `create_shortcut.bat` optionally creates an icon-bearing desktop shortcut.
-5. On Windows, `build_windows.bat` optionally installs PyInstaller and creates `dist/Standgrox Maker Bot.exe`. Place your private `.env` beside the EXE. The EXE build has not been verified here on Windows.
+4. Run `py main.py` or double-click `run_app.pyw`. Choose EN/TR on the login screen, enter the token and bot signing key from the same login session, then click **Verify connection and sign in**. Existing local `.env` values can prefill the fields. The check only reads your balance; it never submits a trade or changes leverage. It checks key format, not whether the key matches the token for signed orders. `create_shortcut.bat` optionally creates a desktop shortcut.
+5. On Windows, `build_windows.bat` optionally installs PyInstaller and creates `dist/Standgrox Maker Bot.exe`. The EXE opens the same login screen; a `.env` beside it is optional. The EXE build has not been verified here on Windows.
+
+**Remember on this Windows account** stores credentials in Windows Credential Manager, not a plaintext file. Leave it unchecked for a memory-only session (previously saved credentials are removed). If secure saving fails, uncheck Remember and retry. **Sign out** is available after stopping the bot and waiting for cleanup; it returns to login. **Delete saved login** removes saved credentials without revoking the token or changing an existing `.env`. Never enter a wallet private key or recovery phrase in the desktop login fields. Token creation still uses the initial helpers above; automatic wallet connection is not implemented.
 
 The app starts in **simulation** mode. Select a market, target/min/max BPS, balance usage (up to 100%), leverage, and emergency loss threshold. The original panel layout and settings remain. With defaults of target 5.5 and minimum 5 BPS, approaching orders are pulled at or below 5.25 BPS from mark. The bot also pulls an order when the executable opposite book approaches within 1 BPS. It polls every three seconds and has no 10-second replacement delay. For real orders, check **Enable live orders** and confirm. The bot may change account leverage if there are no open orders or positions on that market. At 100% balance usage the exchange may reject a quote if additional fee reserves are needed.
 

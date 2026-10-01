@@ -1,4 +1,4 @@
-"""Double-click on Windows to open the dashboard without a console."""
-from main import Dashboard
+"""Double-click to open the login screen and dashboard without a console."""
+from main import launch_app
 
-Dashboard().run()
+launch_app()
