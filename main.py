@@ -132,6 +132,7 @@ class MakerBot:
         self.qty_decimals = int(self.info["qty_tick_decimals"])
         self.min_qty = D(self.info["min_order_qty"])
         self.entry_submitted = False
+        self.pair_quote_qty = None
         self.exit_submitted = False
         self.active_entry_ids = set()
         self.pending_entry_cancels = {}
@@ -687,6 +688,16 @@ class MakerBot:
             )
         return qty
 
+    def entry_pair_qty(self, mark, owned):
+        # A resting quote has already locked part of the pair's margin. Keep
+        # its original common size instead of halving the remaining free balance.
+        if not owned:
+            self.pair_quote_qty = self.entry_qty(mark)
+        elif getattr(self, "pair_quote_qty", None) is None:
+            # Recover a common size from observed orders if no plan is cached.
+            self.pair_quote_qty = min(D(order["qty"]) for order in owned)
+        return self.pair_quote_qty
+
     def manage_entry(self, mark, orders):
         try:
             mark, best_bid, best_ask = self.live_snapshot()
@@ -711,7 +722,7 @@ class MakerBot:
         if any(len(rows) > 1 for rows in sides.values()):
             raise RuntimeError("Duplicate bot entry orders; stopped")
         try:
-            planned_qty = self.entry_qty(mark) if not owned else None
+            planned_qty = self.entry_pair_qty(mark, owned)
         except RuntimeError as exc:
             if "below minimum" not in str(exc):
                 raise
@@ -734,7 +745,8 @@ class MakerBot:
                 current_book_safe = not self.too_close_to_book(
                     side, D(current["price"]), mark, best_bid, best_ask)
                 if (MIN_BPS + EARLY_PULL_BPS < distance <= MAX_BPS
-                        and current_book_safe):
+                        and current_book_safe
+                        and D(current["qty"]) == planned_qty):
                     continue
                 # Check the prospective quote while the current order is still
                 # resting. Keep an eligible, safe quote when the new snapshot
@@ -768,7 +780,7 @@ class MakerBot:
                 self.log(f"Waiting: {side} entry is too close to the order book")
                 continue
             try:
-                qty = planned_qty if planned_qty is not None else self.entry_qty(mark)
+                qty = planned_qty
             except RuntimeError as exc:
                 if "below minimum" not in str(exc):
                     raise

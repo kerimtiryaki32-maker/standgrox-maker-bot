@@ -152,6 +152,38 @@ class LiveGuardTests(unittest.TestCase):
         self.bot.protect_entries_once()
         self.assertEqual(len(self.posts), 1)
 
+    def test_one_side_replacement_keeps_original_pair_size(self):
+        b = self.bot
+        b.entry_qty = lambda mark: Decimal('.0118')
+        self.assertEqual(b.entry_pair_qty(Decimal('100'), []), Decimal('.0118'))
+        b.entry_qty = lambda mark: self.fail('Locked balance must not resize the pair')
+        self.assertEqual(b.entry_pair_qty(Decimal('100'), [{'qty': '.0118'}]),
+                         Decimal('.0118'))
+
+    def test_empty_pair_recalculates_from_current_budget(self):
+        b = self.bot
+        b.pair_quote_qty = Decimal('.0118')
+        b.entry_qty = lambda mark: Decimal('.0100')
+        self.assertEqual(b.entry_pair_qty(Decimal('100'), []), Decimal('.0100'))
+
+    def test_safe_but_mismatched_quote_is_replaced_with_common_size(self):
+        b = self.bot
+        b.pair_quote_qty = Decimal('.0118')
+        b.price_decimals = 3
+        b.get_position = lambda: (Decimal(0), Decimal(0))
+        b.all_open_orders = lambda: []
+        canceled = []
+        b.cancel = lambda order: canceled.append(order['side'])
+        orders = [{'symbol': main.SYMBOL, 'side': side, 'price': price,
+                   'qty': qty, 'cl_ord_id': main.PREFIX + side,
+                   'reduce_only': False}
+                  for side, price, qty in [('buy', '99.945', '.0067'),
+                                           ('sell', '100.055', '.0118')]]
+        b.manage_entry(Decimal('100'), orders)
+        self.assertEqual(canceled, ['buy'])
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(self.posts[0][1]['qty'], '0.0118')
+
     def test_http_backup_unblocks_missing_live_feed(self):
         b = self.bot
         b.invalidate_market()
